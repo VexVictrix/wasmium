@@ -1,4 +1,4 @@
-use js_sys::{BigInt, Function, Object, Reflect, Uint8Array, WebAssembly};
+use js_sys::Function;
 use wasm_bindgen::prelude::*;
 use crate::MemoryHandle;
 

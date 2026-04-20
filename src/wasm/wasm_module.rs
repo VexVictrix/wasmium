@@ -1,6 +1,5 @@
 use js_sys::{BigInt, Function, Object, Reflect, Uint8Array, WebAssembly};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::sys;
 use crate::MemoryHandle;
 use crate::HostFunction;
 use crate::sys_functions;
@@ -11,6 +10,7 @@ use crate::sys_functions;
 pub struct WasmModule {
 	pub instance: WebAssembly::Instance,
 	pub memory: MemoryHandle,
+	pub functions: std::collections::HashMap<String, Function>,
 } // end struct WasmModule
 
 impl WasmModule {
@@ -46,12 +46,29 @@ impl WasmModule {
 		let memory_js = Reflect::get(&instance.exports(), &JsValue::from_str("memory"))?
 			.dyn_into::<WebAssembly::Memory>()
 			.map_err(|_| JsValue::from_str("Exported memory is not WebAssembly.Memory"))?;
+		memory.set_memory(memory_js);
 		let alloc_fn = Reflect::get(&instance.exports(), &JsValue::from_str("alloc"))?
 			.dyn_into::<Function>()
 			.map_err(|_| JsValue::from_str("Exported alloc is not a function"))?;
-		memory.set_memory(memory_js);
 		memory.set_alloc(alloc_fn);
-		let module = Self { instance, memory };
+		let free_fn = Reflect::get(&instance.exports(), &JsValue::from_str("free"))?
+			.dyn_into::<Function>()
+			.map_err(|_| JsValue::from_str("Exported free is not a function"))?;
+		memory.set_free(free_fn);
+		let mut module = Self { instance, memory, functions: std::collections::HashMap::new() };
+
+		// Extract all exported functions from the WASM module and store
+		// them in the WasmModule struct for easy access
+		for export in Object::keys(&module.instance.exports()).iter() {
+			let export_name = export.as_string().unwrap_or_default();
+			let export_value = Reflect::get(&module.instance.exports(), &export)?;
+			if let Ok(function) = export_value.dyn_into::<Function>() {
+				if export_name != "alloc" && export_name != "free" {
+					module.functions.insert(export_name, function);
+				} // end skip alloc and free in exported functions
+			}
+		} // end loop to log exported functions for debugging
+
 		module.call::<(), ()>("__sys_init", ())?;
 		Ok(module)
 	} // end fn new
@@ -64,14 +81,8 @@ impl WasmModule {
 	/// Call the exported free function of the WASM module to free memory
 	/// at the given pointer and size
 	pub fn call_free(&self, ptr: u32, size: u32) -> Result<(), JsValue> {
-		let func = Reflect::get(&self.instance.exports(), &JsValue::from_str("free"))
-			.expect("Function not found")
-			.dyn_into::<Function>()
-			.expect("Export is not a function");
-		func.call2(&JsValue::NULL, &JsValue::from(ptr), &JsValue::from(size))?;
-		Ok(())
+		self.memory.call_free(ptr, size)
 	} // end fn call_free
-
 
 	/// Call an exported WASM function that takes a pointer and length
 	/// as input and returns a pointer and length as output, handling
@@ -79,10 +90,9 @@ impl WasmModule {
 	pub fn call_ptr(&self, func_name: &str, ptr: u32, len: u32) -> Result<Vec<u8>, JsValue> {
 		
 		// Get the exported function from the WASM module by name, ensuring it exists and is a function
-		let func = Reflect::get(&self.instance.exports(), &JsValue::from_str(func_name))
-			.expect("Function not found")
-			.dyn_into::<Function>()
-			.expect(&format!("Export is not a function {}", func_name));
+		let func = self.functions
+			.get(func_name)
+			.ok_or_else(|| JsValue::from_str(&format!("Function '{}' not found", func_name)))?;
 		
 		// Call the function with the pointer and length as arguments, expecting a BigInt return value that encodes the result pointer and length
 		let result = func.call2(&JsValue::NULL, &JsValue::from(ptr), &JsValue::from(len))?;

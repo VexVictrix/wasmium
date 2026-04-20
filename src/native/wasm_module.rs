@@ -8,32 +8,40 @@ pub struct WasmModule {
 	instance: wasmtime::Instance,
 	store: wasmtime::Store<()>,
 	memory: wasmtime::Memory,
-	alloc: std::sync::Arc<std::sync::Mutex<Option<wasmtime::Func>>>,
+	alloc: std::sync::Arc<std::sync::OnceLock<wasmtime::TypedFunc<i32, i32>>>,
+	free: std::sync::Arc<std::sync::OnceLock<wasmtime::TypedFunc<(i32, i32), ()>>>,
+	functions: std::collections::HashMap<String, wasmtime::TypedFunc<(i32, i32), i64>>,
 } // end struct WasmModule
-
-pub type AllocFunc = std::sync::Arc<std::sync::Mutex<Option<wasmtime::Func>>>;
-
-/// Call the alloc function exported by the WASM module to allocate memory for input or output data, returning the pointer to the allocated memory
-pub fn call_alloc(module: &mut WasmModule, size: u32) -> Result<u32, Box<dyn std::error::Error>> {
-	let binding = module.alloc.lock().unwrap();
-	let alloc_func = binding.as_ref().ok_or("Allocation function not set")?;
-	let mut results = [wasmtime::Val::I32(0)];
-	alloc_func.call(&mut module.store, &[wasmtime::Val::I32(size as i32)], &mut results)?;
-	if let wasmtime::Val::I32(ptr) = results[0] { Ok(ptr as u32)
-	} else { Err("Alloc function did not return an i32".into()) }
-} // end fn call_alloc
 
 /// Generic wrapper for HostFunction that handles serialization and deserialization
 /// of input and output data, allowing Rust closures to be easily exposed as WASM
 /// imports without needing to manually manage memory or data formats
-pub fn func_wrap<I: DeserializeOwned, O: Serialize>(linker: &mut wasmtime::Linker<()>, alloc: AllocFunc, module_name: &str, func_name: &str, func: impl Fn(I) -> O + Send + Sync + 'static) -> Result<(), Box<dyn std::error::Error>> {
+pub fn func_wrap<I: DeserializeOwned, O: Serialize>(
+	linker: &mut wasmtime::Linker<()>,
+	alloc: std::sync::Arc<std::sync::OnceLock<wasmtime::TypedFunc<i32, i32>>>,
+	module_name: &str,
+	func_name: &str,
+	func: impl Fn(I) -> O + Send + Sync + 'static
+) -> Result<(), Box<dyn std::error::Error>> {
+
+	// Clone the module and function name strings to ensure they are owned and can be moved into the closure
 	let module_name = module_name.to_string();
 	let out_module_name = module_name.clone();
 	let func_name = func_name.to_string();
 	let out_func_name = func_name.clone();
+	
+	// Define the host function that will be called by the WASM module,
+	// which reads input data from WASM memory, deserializes it, calls
+	// the provided Rust closure, serializes the output, allocates memory
+	// for the output in WASM, writes the output back to WASM memory, and
+	// returns a pointer and length to the output data
 	let func = move |mut caller: wasmtime::Caller<'_, ()>, ptrlen: u64| -> u64 {
+		
+		// Extract the pointer and length from the combined u64 argument
 		let ptr = (ptrlen >> 32) as u32;
 		let len = (ptrlen & 0xffffffff) as u32;
+		
+		// Read the input data from WASM memory into a Rust byte vector
 		let mut memory_read = vec![0; len as usize];
 		let memory = caller
 			.get_export("memory")
@@ -41,38 +49,55 @@ pub fn func_wrap<I: DeserializeOwned, O: Serialize>(linker: &mut wasmtime::Linke
 			.expect(&format!("Host function '{}.{}' could not access exported memory", module_name, func_name));
 		let _ = memory.read(&mut caller, ptr as usize, &mut memory_read)
 			.expect(&format!("Host function '{}.{}' failed to read memory for ptr={}, len={}", module_name, func_name, ptr, len));
+		
+		// Deserialize the input data using rmp_serde, call the provided Rust closure with
+		// the deserialized input, serialize the output using rmp_serde, allocate memory
+		// for the output in WASM, write the output back to WASM memory, and return a pointer
+		// and length to the output data
 		let input_data = rmp_serde::from_slice(&memory_read).expect(&format!("Host function '{}.{}' failed to deserialize input", module_name, func_name));
 		let output_bytes = rmp_serde::to_vec(&func(input_data)).expect(&format!("Host function '{}.{}' failed to serialize output", module_name, func_name));
-		if let Some(alloc_func) = alloc.lock().unwrap().as_ref() {
-			let mut results = [wasmtime::Val::I32(0)];
-			alloc_func.call(&mut caller, &[wasmtime::Val::I32(output_bytes.len() as i32)], &mut results)
-				.expect(&format!("Host function '{}.{}' failed to call alloc for output size {}", module_name, func_name, output_bytes.len()));
-			if let wasmtime::Val::I32(output_ptr) = results[0] {
-				memory.write(&mut caller, output_ptr as usize, &output_bytes)
-					.expect(&format!("Host function '{}.{}' failed to write output to memory at ptr={}, len={}", module_name, func_name, output_ptr, output_bytes.len()));
-				// Return the pointer and length packed into a single u64
-				let result_ptrlen = ((output_ptr as u64) << 32) | (output_bytes.len() as u64);
-				result_ptrlen
-			} else {
-				panic!("Host function '{}.{}' alloc did not return an i32", module_name, func_name);
-			}
-		} else {
-			panic!("Host function '{}.{}' called before alloc function was set", module_name, func_name);
-		}
+		let alloc_func = alloc.get().expect(&format!("Host function '{}.{}' called before alloc function was set", module_name, func_name));
+		let output_ptr = alloc_func.call(&mut caller, output_bytes.len() as i32)
+			.expect(&format!("Host function '{}.{}' failed to call alloc for output size {}", module_name, func_name, output_bytes.len()));
+		memory.write(&mut caller, output_ptr as usize, &output_bytes)
+			.expect(&format!("Host function '{}.{}' failed to write output to memory at ptr={}, len={}", module_name, func_name, output_ptr, output_bytes.len()));
+		// Return the pointer and length packed into a single u64
+		let result_ptrlen = ((output_ptr as u64) << 32) | (output_bytes.len() as u64);
+		result_ptrlen
 	};
 	linker.func_wrap(&out_module_name.clone(), &out_func_name.clone(), func)?;
 	Ok(())
 } // end fn func_wrap
 
-/// Wrapper for HostFunction that operates on raw byte slices, allowing for maximum flexibility in how the function processes input and produces output, without any assumptions about data formats or serialization
-pub fn func_wrap_bytes(linker: &mut wasmtime::Linker<()>, alloc: AllocFunc, module_name: &str, func_name: &str, func: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static) -> Result<(), Box<dyn std::error::Error>> {
+/// Wrapper for HostFunction that operates on raw byte slices, allowing for maximum
+/// flexibility in how the function processes input and produces output, without any
+/// assumptions about data formats or serialization
+pub fn func_wrap_bytes(
+	linker: &mut wasmtime::Linker<()>,
+	alloc: std::sync::Arc<std::sync::OnceLock<wasmtime::TypedFunc<i32, i32>>>,
+	module_name: &str,
+	func_name: &str,
+	func: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static
+) -> Result<(), Box<dyn std::error::Error>> {
+
+	// Clone the module and function name strings to ensure they are owned and can be moved into the closure
 	let module_name = module_name.to_string();
 	let out_module_name = module_name.clone();
 	let func_name = func_name.to_string();
 	let out_func_name = func_name.clone();
+	
+	// Define the host function that will be called by the WASM module,
+	// which reads input data from WASM memory, deserializes it, calls
+	// the provided Rust closure, serializes the output, allocates memory
+	// for the output in WASM, writes the output back to WASM memory, and
+	// returns a pointer and length to the output data
 	let func = move |mut caller: wasmtime::Caller<'_, ()>, ptrlen: u64| -> u64 {
+		
+		// Extract the pointer and length from the combined u64 argument
 		let ptr = (ptrlen >> 32) as u32;
 		let len = (ptrlen & 0xffffffff) as u32;
+		
+		// Read the input data from WASM memory into a Rust byte vector
 		let mut memory_read = vec![0; len as usize];
 		let memory = caller
 			.get_export("memory")
@@ -80,23 +105,19 @@ pub fn func_wrap_bytes(linker: &mut wasmtime::Linker<()>, alloc: AllocFunc, modu
 			.expect(&format!("Host function '{}.{}' could not access exported memory", module_name, func_name));
 		let _ = memory.read(&mut caller, ptr as usize, &mut memory_read)
 			.expect(&format!("Host function '{}.{}' failed to read memory for ptr={}, len={}", module_name, func_name, ptr, len));
-		let output_bytes = func(&memory_read);
-		if let Some(alloc_func) = alloc.lock().unwrap().as_ref() {
-			let mut results = [wasmtime::Val::I32(0)];
-			alloc_func.call(&mut caller, &[wasmtime::Val::I32(output_bytes.len() as i32)], &mut results)
-				.expect(&format!("Host function '{}.{}' failed to call alloc for output size {}", module_name, func_name, output_bytes.len()));
-			if let wasmtime::Val::I32(output_ptr) = results[0] {
-				memory.write(&mut caller, output_ptr as usize, &output_bytes)
-					.expect(&format!("Host function '{}.{}' failed to write output to memory at ptr={}, len={}", module_name, func_name, output_ptr, output_bytes.len()));
-				// Return the pointer and length packed into a single u64
-				let result_ptrlen = ((output_ptr as u64) << 32) | (output_bytes.len() as u64);
-				result_ptrlen
-			} else {
-				panic!("Host function '{}.{}' alloc did not return an i32", module_name, func_name);
-			}
-		} else {
-			panic!("Host function '{}.{}' called before alloc function was set", module_name, func_name);
-		}
+		
+		// For the bytes version, we just pass the raw bytes
+		// to the closure without deserialization
+		let input_data = memory_read;
+		let output_bytes = func(&input_data);
+		let alloc_func = alloc.get().expect(&format!("Host function '{}.{}' called before alloc function was set", module_name, func_name));
+		let output_ptr = alloc_func.call(&mut caller, output_bytes.len() as i32)
+			.expect(&format!("Host function '{}.{}' failed to call alloc for output size {}", module_name, func_name, output_bytes.len()));
+		memory.write(&mut caller, output_ptr as usize, &output_bytes)
+			.expect(&format!("Host function '{}.{}' failed to write output to memory at ptr={}, len={}", module_name, func_name, output_ptr, output_bytes.len()));
+		// Return the pointer and length packed into a single u64
+		let result_ptrlen = ((output_ptr as u64) << 32) | (output_bytes.len() as u64);
+		result_ptrlen
 	};
 	linker.func_wrap(&out_module_name.clone(), &out_func_name.clone(), func)?;
 	Ok(())
@@ -111,7 +132,7 @@ impl WasmModule {
 		let module = wasmtime::Module::new(&native::ENGINE, bytes)?;
 		let mut store = wasmtime::Store::new(&native::ENGINE, ());
 		let mut linker = wasmtime::Linker::new(&native::ENGINE);
-		let alloc: AllocFunc = std::sync::Arc::new(std::sync::Mutex::new(None));
+		let alloc = std::sync::Arc::new(std::sync::OnceLock::new());
 		
 		func_wrap(&mut linker, alloc.clone(), "sys", "log", crate::sys_functions::log)?;
 		
@@ -127,9 +148,32 @@ impl WasmModule {
 		let memory = instance
 			.get_memory(&mut store, "memory")
 			.ok_or("Exported memory not found")?;
-		*alloc.lock().unwrap() = Some(instance.get_func(&mut store, "alloc").ok_or("Alloc function not found")?);
+		let alloc_func = instance.get_func(&mut store, "alloc").ok_or("Alloc function not found")?;
+		let _ = alloc.set(alloc_func.typed::<i32, i32>(&store)?);
+		let free_func = instance.get_func(&mut store, "free").ok_or("Free function not found")?;
+		let free = std::sync::Arc::new(std::sync::OnceLock::new());
+		let _ = free.set(free_func.typed::<(i32, i32), ()>(&store)?);
+
+		let mut exports = std::collections::HashMap::new();
 		
-		let mut module = Self { module, instance, store, memory, alloc };
+		// Iterate over all exports in the module and store any functions that match the expected signature for exported functions
+		for export in module.exports() {
+			if let wasmtime::ExternType::Func(func_ty) = export.ty() {
+				// We expect exported functions to have the signature (i32, i32) -> i64, where the input is a pointer and length to serialized input data, and the output is a pointer and length packed into an i64
+				let params: Vec<_> = func_ty.params().collect();
+				let results: Vec<_> = func_ty.results().collect();
+				if params.len() == 2 && results.len() == 1 {
+					if let (wasmtime::ValType::I32, wasmtime::ValType::I32) = (params[0].clone(), params[1].clone()) {
+						if let wasmtime::ValType::I64 = results[0] {
+							let func = instance.get_func(&mut store, export.name()).ok_or(format!("Exported function '{}' not found", export.name()))?;
+							exports.insert(export.name().to_string(), func.typed::<(i32, i32), i64>(&store)?);
+						}
+					}
+				}
+			}
+		}
+		
+		let mut module = Self { module, instance, store, memory, alloc, free, functions: exports };
 		
 		// Call the initialization function to set up panic hooks and any other necessary runtime state
 		module.call::<(), ()>("__sys_init", ()).ok();
@@ -137,15 +181,19 @@ impl WasmModule {
 		Ok(module)
 	} // end fn new
 
-	/// Allocate memory in the WASM module by calling the exported alloc function with the given size
+	/// Call the alloc function exported by the WASM module to allocate memory for input or
+	/// output data, returning the pointer to the allocated memory
 	pub fn call_alloc(&mut self, size: u32) -> Result<u32, Box<dyn std::error::Error>> {
-		call_alloc(self, size)
+		let alloc_func = self.alloc.get().ok_or("Allocation function not set")?;
+		let ptr = alloc_func.call(&mut self.store, size as i32)?;
+		Ok(ptr as u32)
 	} // end fn call_alloc
 
-	/// Free memory in the WASM module at the given pointer and size
+	/// Call the free function exported by the WASM module to free memory at the
+	/// given pointer and size, ensuring that any allocated resources are properly released
 	pub fn call_free(&mut self, ptr: u32, size: u32) -> Result<(), Box<dyn std::error::Error>> {
-		let free_func = self.instance.get_func(&mut self.store, "free").ok_or("Free function not found")?;
-		free_func.call(&mut self.store, &[wasmtime::Val::I32(ptr as i32), wasmtime::Val::I32(size as i32)], &mut [])?;
+		let free_func = self.free.get().ok_or("Free function not set")?;
+		free_func.call(&mut self.store, (ptr as i32, size as i32))?;
 		Ok(())
 	} // end fn call_free
 
