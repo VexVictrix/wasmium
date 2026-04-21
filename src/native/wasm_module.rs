@@ -8,9 +8,9 @@ pub struct WasmModule {
 	instance: wasmtime::Instance,
 	store: wasmtime::Store<()>,
 	memory: wasmtime::Memory,
-	alloc: std::sync::Arc<std::sync::OnceLock<wasmtime::TypedFunc<i32, i32>>>,
-	free: std::sync::Arc<std::sync::OnceLock<wasmtime::TypedFunc<(i32, i32), ()>>>,
-	functions: std::collections::HashMap<String, wasmtime::TypedFunc<(i32, i32), i64>>,
+	alloc: std::sync::Arc<std::sync::OnceLock<wasmtime::TypedFunc<u32, u32>>>,
+	free: std::sync::Arc<std::sync::OnceLock<wasmtime::TypedFunc<(u32, u32), ()>>>,
+	functions: std::collections::HashMap<String, wasmtime::TypedFunc<(u32, u32), u64>>,
 } // end struct WasmModule
 
 /// Generic wrapper for HostFunction that handles serialization and deserialization
@@ -18,7 +18,7 @@ pub struct WasmModule {
 /// imports without needing to manually manage memory or data formats
 pub fn func_wrap<I: DeserializeOwned, O: Serialize>(
 	linker: &mut wasmtime::Linker<()>,
-	alloc: std::sync::Arc<std::sync::OnceLock<wasmtime::TypedFunc<i32, i32>>>,
+	alloc: std::sync::Arc<std::sync::OnceLock<wasmtime::TypedFunc<u32, u32>>>,
 	module_name: &str,
 	func_name: &str,
 	func: impl Fn(I) -> O + Send + Sync + 'static
@@ -57,7 +57,7 @@ pub fn func_wrap<I: DeserializeOwned, O: Serialize>(
 		let input_data = rmp_serde::from_slice(&memory_read).expect(&format!("Host function '{}.{}' failed to deserialize input", module_name, func_name));
 		let output_bytes = rmp_serde::to_vec(&func(input_data)).expect(&format!("Host function '{}.{}' failed to serialize output", module_name, func_name));
 		let alloc_func = alloc.get().expect(&format!("Host function '{}.{}' called before alloc function was set", module_name, func_name));
-		let output_ptr = alloc_func.call(&mut caller, output_bytes.len() as i32)
+		let output_ptr = alloc_func.call(&mut caller, output_bytes.len() as u32)
 			.expect(&format!("Host function '{}.{}' failed to call alloc for output size {}", module_name, func_name, output_bytes.len()));
 		memory.write(&mut caller, output_ptr as usize, &output_bytes)
 			.expect(&format!("Host function '{}.{}' failed to write output to memory at ptr={}, len={}", module_name, func_name, output_ptr, output_bytes.len()));
@@ -74,7 +74,7 @@ pub fn func_wrap<I: DeserializeOwned, O: Serialize>(
 /// assumptions about data formats or serialization
 pub fn func_wrap_bytes(
 	linker: &mut wasmtime::Linker<()>,
-	alloc: std::sync::Arc<std::sync::OnceLock<wasmtime::TypedFunc<i32, i32>>>,
+	alloc: std::sync::Arc<std::sync::OnceLock<wasmtime::TypedFunc<u32, u32>>>,
 	module_name: &str,
 	func_name: &str,
 	func: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static
@@ -111,7 +111,7 @@ pub fn func_wrap_bytes(
 		let input_data = memory_read;
 		let output_bytes = func(&input_data);
 		let alloc_func = alloc.get().expect(&format!("Host function '{}.{}' called before alloc function was set", module_name, func_name));
-		let output_ptr = alloc_func.call(&mut caller, output_bytes.len() as i32)
+		let output_ptr = alloc_func.call(&mut caller, output_bytes.len() as u32)
 			.expect(&format!("Host function '{}.{}' failed to call alloc for output size {}", module_name, func_name, output_bytes.len()));
 		memory.write(&mut caller, output_ptr as usize, &output_bytes)
 			.expect(&format!("Host function '{}.{}' failed to write output to memory at ptr={}, len={}", module_name, func_name, output_ptr, output_bytes.len()));
@@ -149,10 +149,10 @@ impl WasmModule {
 			.get_memory(&mut store, "memory")
 			.ok_or("Exported memory not found")?;
 		let alloc_func = instance.get_func(&mut store, "alloc").ok_or("Alloc function not found")?;
-		let _ = alloc.set(alloc_func.typed::<i32, i32>(&store)?);
+		let _ = alloc.set(alloc_func.typed::<u32, u32>(&store)?);
 		let free_func = instance.get_func(&mut store, "free").ok_or("Free function not found")?;
 		let free = std::sync::Arc::new(std::sync::OnceLock::new());
-		let _ = free.set(free_func.typed::<(i32, i32), ()>(&store)?);
+		let _ = free.set(free_func.typed::<(u32, u32), ()>(&store)?);
 
 		let mut exports = std::collections::HashMap::new();
 		
@@ -166,7 +166,7 @@ impl WasmModule {
 					if let (wasmtime::ValType::I32, wasmtime::ValType::I32) = (params[0].clone(), params[1].clone()) {
 						if let wasmtime::ValType::I64 = results[0] {
 							let func = instance.get_func(&mut store, export.name()).ok_or(format!("Exported function '{}' not found", export.name()))?;
-							exports.insert(export.name().to_string(), func.typed::<(i32, i32), i64>(&store)?);
+							exports.insert(export.name().to_string(), func.typed::<(u32, u32), u64>(&store)?);
 						}
 					}
 				}
@@ -185,31 +185,28 @@ impl WasmModule {
 	/// output data, returning the pointer to the allocated memory
 	pub fn call_alloc(&mut self, size: u32) -> Result<u32, Box<dyn std::error::Error>> {
 		let alloc_func = self.alloc.get().ok_or("Allocation function not set")?;
-		let ptr = alloc_func.call(&mut self.store, size as i32)?;
-		Ok(ptr as u32)
+		let ptr = alloc_func.call(&mut self.store, size)?;
+		Ok(ptr)
 	} // end fn call_alloc
 
 	/// Call the free function exported by the WASM module to free memory at the
 	/// given pointer and size, ensuring that any allocated resources are properly released
 	pub fn call_free(&mut self, ptr: u32, size: u32) -> Result<(), Box<dyn std::error::Error>> {
 		let free_func = self.free.get().ok_or("Free function not set")?;
-		free_func.call(&mut self.store, (ptr as i32, size as i32))?;
+		free_func.call(&mut self.store, (ptr, size))?;
 		Ok(())
 	} // end fn call_free
 
 	/// Call an exported WASM function that takes a pointer and length as input and returns a pointer and length as output
 	pub fn call_ptr(&mut self, func_name: &str, ptr: u32, len: u32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-		let func = self.instance.get_func(&mut self.store, func_name).ok_or(format!("Function '{}' not found", func_name))?;
-		let mut results = [wasmtime::Val::I64(0)];
-		func.call(&mut self.store, &[wasmtime::Val::I32(ptr as i32), wasmtime::Val::I32(len as i32)], &mut results)?;
-		if let wasmtime::Val::I64(result_ptrlen) = results[0] {
-			let result_ptr = ((result_ptrlen as u64) >> 32) as u32;
-			let result_len = ((result_ptrlen as u64) & 0xffffffff) as u32;
-			let mut result_data = vec![0; result_len as usize];
-			self.memory.read(&self.store, result_ptr as usize, &mut result_data)?;
-			self.call_free(result_ptr, result_len)?;
-			Ok(result_data)
-		} else { Err("Function did not return an i64 ptr/len".into()) }
+		let func = self.functions.get(func_name).ok_or(format!("Function '{}' not found in exports", func_name))?;
+		let results = func.call(&mut self.store, (ptr, len))?;
+		let result_ptr = ((results as u64) >> 32) as u32;
+		let result_len = ((results as u64) & 0xffffffff) as u32;
+		let mut result_data = vec![0; result_len as usize];
+		self.memory.read(&self.store, result_ptr as usize, &mut result_data)?;
+		self.call_free(result_ptr, result_len)?;
+		Ok(result_data)
 	} // end fn call_ptr
 
 	/// Call an exported WASM function that takes a serialized input and returns a serialized output,
