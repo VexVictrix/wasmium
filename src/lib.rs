@@ -1,15 +1,16 @@
-
-#[cfg(not(target_arch = "wasm32"))]
-mod native;
-#[cfg(not(target_arch = "wasm32"))]
-pub use native::*;
-
-#[cfg(target_arch = "wasm32")]
-mod wasm;
-#[cfg(target_arch = "wasm32")]
-pub use wasm::*;
-
+mod api; use api::*;
+pub use api::*;
 mod sys_functions;
+
+#[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
+pub use api::native_wasmium_module::WasmiumModule;
+#[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
+pub mod native;
+
+#[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
+pub use api::web_wasmium_module::WasmiumModule;
+#[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
+pub mod web;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(test)]
@@ -17,8 +18,8 @@ mod tests {
 	use super::*;
 	#[test]
 	fn test_native() {
-		let example_plugin_bytes = include_bytes!("../example-plugin/example_plugin.wasm");
-		let mut example_plugin = WasmModule::new(example_plugin_bytes, vec![
+		let example_plugin_bytes = include_bytes!("./example-plugin/example_plugin.wasm");
+		let mut example_plugin = WasmiumModule::new(example_plugin_bytes, vec![
 			HostFunction::new("concat_example", move |input: (String, String)| {
 				let (a, b) = input;
 				return a + &b;
@@ -44,9 +45,9 @@ mod wasm_tests {
 	#[wasm_bindgen_test]
 	fn test_wasm() {
 
-		let example_plugin_bytes = include_bytes!("../example-plugin/example_plugin.wasm");
+		let example_plugin_bytes = include_bytes!("./example-plugin/example_plugin.wasm");
 
-		let example_plugin = WasmModule::new(example_plugin_bytes, vec![
+		let mut example_plugin = WasmiumModule::new(example_plugin_bytes, vec![
 			HostFunction::new("concat_example", move |input: (String, String)| {
 				let (a, b) = input;
 				return a + &b;

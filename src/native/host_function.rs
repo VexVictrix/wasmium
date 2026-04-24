@@ -1,30 +1,38 @@
+use crate::native::LinkerHandle;
 
-/// Represents a host function that can be imported by a WASM module, allowing Rust closures to be called from WASM with automatic serialization and deserialization of input and output data
-pub struct HostFunction {
-	pub name: String,
-	pub func: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>,
-} // end struct HostFunction
 
-impl HostFunction {
+pub trait NativeHostFunction {
+	fn into_linked(self, linker: &mut LinkerHandle, module_name: &str);
+} // end trait NativeHostFunction
 
-	/// Create a new HostFunction with a raw byte callback, allowing for maximum flexibility in how the function processes input and produces output
-	pub fn new_bytes(name: impl Into<String>, func: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static) -> Self {
-		Self { name: name.into(), func: Box::new(func) }
-	} // end fn new
+impl NativeHostFunction for crate::HostFunction {
 
-	/// Create a new HostFunction with typed input and output, automatically handling serialization and deserialization using rmp_serde
-	pub fn new<I, O, F>(name: &str, func: F) -> Self
-	where
-		I: serde::de::DeserializeOwned + 'static,
-		O: serde::Serialize + 'static,
-		F: Fn(I) -> O + Send + Sync + 'static,
-	{
-		let name = name.to_string();
-		Self::new_bytes(&name.clone(), move |input| -> Vec<u8> {
-			let input: I = rmp_serde::from_slice(input).expect(&format!("Failed to deserialize input for {}", name));
-			let output: O = func(input);
-			rmp_serde::to_vec(&output).expect(&format!("Failed to serialize output for {}", name))
-		})
-	} // end fn new
+	fn into_linked(self, linker: &mut LinkerHandle, module_name: &str) {
+		let name = self.name.clone();
+		let func = self.function;
+		let memory = linker.memory.clone();
+		let alloc = linker.alloc.clone();
+		let module_name = module_name.to_string();
+		let module_name_clone = module_name.clone();
 
-} // end impl HostFunction
+		let func = move |mut caller: wasmtime::Caller<'_, ()>, ptr: u64| -> u64 {
+			let memory = memory.get().expect(&format!("Memory not set for host function '{}.{}'", module_name, name));
+			let mut length = [0u8; 8];
+			memory.read(&mut caller, ptr as usize, &mut length).unwrap();
+			let len = u64::from_le_bytes(length);
+			let mut input_bytes = vec![0; len as usize];
+			memory.read(&mut caller, ptr as usize + 8, &mut input_bytes).unwrap();
+			let output_bytes = (func)(input_bytes.as_slice());
+			let alloc = alloc.get().expect(&format!("Alloc function not set for host function '{}.{}'", module_name, name));
+			let output_len = output_bytes.len() as u64;
+			let output_ptr = alloc.call(&mut caller, output_len + 8).expect(&format!("Host function '{}.{}' failed to allocate memory for output of size {}", module_name, name, output_len + 8));
+			memory.write(&mut caller, output_ptr as usize, &output_len.to_le_bytes()).expect(&format!("Host function '{}.{}' failed to write output length at ptr={}", module_name, name, output_ptr));
+			memory.write(&mut caller, output_ptr as usize + 8, &output_bytes).expect(&format!("Host function '{}.{}' failed to write output to memory at ptr={}, len={}", module_name, name, output_ptr + 8, output_bytes.len()));
+			output_ptr
+		}; // end let func
+
+		linker.linker.func_wrap(&module_name_clone, &self.name, func).unwrap();
+		
+	} // end fn into_linked
+	
+} // end impl NativeHostFunction for HostFunction
